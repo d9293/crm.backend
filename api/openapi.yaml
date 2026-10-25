@@ -991,6 +991,13 @@ components:
       description: |
         ISO 8601 instant with offset, normally UTC. Business display and report
         boundaries use `Asia/Almaty`, applied by the consumer, not encoded here.
+
+        `Asia/Almaty` is currently **UTC+5**: Kazakhstan unified its timezones
+        on 1 March 2024, moving Almaty from UTC+6 to UTC+5. Instants before
+        that date are still +06. Always convert through the IANA zone
+        identifier and never write a fixed offset by hand — `+06:00` is an
+        hour wrong for current data, and `+05:00` is an hour wrong for 2023
+        data. This matters for migrated records under D-17.
       examples: ["2026-10-25T08:30:00Z"]
 
     LocalDate:
