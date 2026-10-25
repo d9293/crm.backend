@@ -49,3 +49,6 @@ Desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Redocly / npx cache
+node_modules/

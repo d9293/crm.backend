@@ -6,9 +6,19 @@ PostgreSQL is the authoritative persistent store. The API contract is versioned 
 
 ## Status
 
-**Not scaffolded.** `development/README.md` §3 states: *"Do not scaffold a framework until D-01 is resolved."* This repository therefore holds documentation and ignore rules only.
+**Not scaffolded.** `development/README.md` §3 states: *"Do not scaffold a framework until D-01 is resolved."* This repository therefore holds documentation, ignore rules and the API contract — no application code.
 
-Resolve **D-01** — language, framework, session strategy and supported deployment environment — then BE-00 delivers the modular application layout, migrations, OpenAPI document and CI.
+Resolve **D-01** — language, framework, session strategy and supported deployment environment — then BE-00 delivers the modular application layout, migrations and CI.
+
+## API contract
+
+[`api/openapi.yaml`](api/openapi.yaml) — draft S1 contract, covering access, employees, locations and resources. See [`api/README.md`](api/README.md) for validation, type generation and the three shape questions it raises for S0 review.
+
+Written ahead of the server deliberately: the contract is language-neutral, so it is not blocked by D-01, and §3 requires both teams to agree contract examples before a sprint starts.
+
+```sh
+npx @redocly/cli lint    # zero errors, zero warnings
+```
 
 ## Specification
 

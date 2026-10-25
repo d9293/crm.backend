@@ -1,0 +1,1404 @@
+openapi: 3.1.0
+
+info:
+  title: ACE / CSKA CRM API
+  version: 0.1.0
+  summary: Sprint S1 surface — access, employees, locations and resources.
+  description: |
+    Versioned API contract for the ACE / CSKA tennis-centre CRM.
+
+    **Status: draft for S0 contract review.** This document covers the S1 page
+    inventory only (P01 access, P02 employees and permissions, P03 locations
+    and resources). Later sprints extend it; `development/README.md` section 4
+    holds the full page inventory.
+
+    This is a proposal for both teams to agree, not an owner-approved business
+    rule set. Where a shape depends on an unresolved decision, the affected
+    operation or field carries a `GATE` note naming the decision. Those parts
+    must not be treated as implementation-ready.
+
+    ## Conventions
+
+    Defined in `development/README.md` section 8 and applied throughout:
+
+    - Identity is derived server-side from the session. The client never
+      supplies its own role, customer ownership or requester identity.
+    - Location is explicit on location-scoped calls and is checked server-side.
+      Absence of a capability grant means denial.
+    - List endpoints use documented pagination with stable ordering. `total`
+      counts all matching records, not the current page.
+    - Mutable records carry an integer `version` and an `ETag`. Mutations
+      require `If-Match`; a stale value fails with `VERSION_CONFLICT` rather
+      than silently overwriting.
+    - Instants are ISO 8601 with offset. Containers and the database run in
+      UTC; `Asia/Almaty` is the business timezone for display, report
+      boundaries and recurrence expansion.
+    - Errors use one shape, `Error`. No stack traces and no personal data.
+
+    ## Error codes
+
+    From `development/README.md` section 8:
+    `SLOT_UNAVAILABLE`, `HOLD_EXPIRED`, `CANCELLATION_CUTOFF_PASSED`,
+    `INVALID_TRANSITION`, `VERSION_CONFLICT`, `CAPACITY_EXCEEDED`,
+    `PAYMENT_ALREADY_APPLIED`, `REFUND_LIMIT_EXCEEDED`.
+
+    Proposed additions needed by S1, for review — section 8 lists domain codes
+    only and does not cover access or this sprint's constraints:
+    `INVALID_CREDENTIALS`, `ACCOUNT_BLOCKED`, `RATE_LIMITED`,
+    `NOT_AUTHENTICATED`, `FORBIDDEN`, `VALIDATION_FAILED`, `NOT_FOUND`,
+    `LAST_POWER_USER_PROTECTED`, `RESOURCE_LOCATION_MISMATCH`,
+    `CLOSURE_CONFLICTS_BOOKINGS`.
+
+    ## Open questions this draft surfaces
+
+    1. **Opening hours across midnight.** Courts run 07:00–00:00 and a 00:00
+       end belongs to the next calendar date. This draft models that as
+       `closes_at` plus an explicit `closes_next_day` flag rather than a
+       `24:00` string, so no consumer has to parse an out-of-range time. Needs
+       confirmation.
+    2. **Pagination style.** `limit`/`offset` with a `total` is proposed for
+       directory endpoints. Finance and audit lists in later sprints may need
+       cursor pagination for stable paging over changing data; deciding now
+       avoids two styles.
+    3. **Employee identifier for sign-in.** `identifier` is deliberately
+       opaque here — whether staff sign in by email, phone or username is part
+       of D-02 and must not be fixed by this contract.
+
+  contact:
+    name: Specification repository
+    url: https://github.com/d9293/crm.docs
+  license:
+    name: Proprietary — all rights reserved by the owner
+    identifier: LicenseRef-Proprietary
+
+servers:
+  - url: /api/v1
+    description: Versioned base path. Breaking changes require a new major path.
+
+tags:
+  - name: Access
+    description: Sign in, session state and current user. Page P01.
+  - name: Employees
+    description: Staff accounts, roles and capability grants. Page P02.
+  - name: Locations
+    description: ACE and CSKA. Page P03.
+  - name: Resources
+    description: Courts, rooms, operating hours and closures. Page P03.
+  - name: Metadata
+    description: Role and capability catalogue for permission-aware UI.
+
+security:
+  - sessionCookie: []
+
+paths:
+  # ===========================================================================
+  # Access — P01 / BE-01
+  # ===========================================================================
+  /session:
+    post:
+      operationId: createSession
+      tags: [Access]
+      summary: Sign in
+      description: |
+        Establishes a session and sets the session cookie. The response body
+        carries no token: the session lives in a `Secure`, `HttpOnly` cookie,
+        so client JavaScript cannot read it and cannot persist it to
+        browser-readable storage.
+
+        Failure is deliberately uninformative. Wrong password, unknown account
+        and blocked account all return `INVALID_CREDENTIALS` with the same
+        message, so the endpoint cannot be used to discover whether an account
+        exists. `ACCOUNT_BLOCKED` is returned only once credentials have
+        already been proven correct.
+
+        Throttled per `development/infra.md` INF-02. Throttling must apply to
+        this endpoint even when the backend port is addressed directly.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier, password]
+              additionalProperties: false
+              properties:
+                identifier:
+                  type: string
+                  minLength: 1
+                  maxLength: 320
+                  description: |
+                    Account identifier. Deliberately opaque: whether staff and
+                    customers sign in by email, phone or username is D-02.
+                    GATE D-02.
+                  examples: ["operator.ace"]
+                password:
+                  type: string
+                  format: password
+                  minLength: 1
+                  maxLength: 1024
+      responses:
+        "201":
+          description: Session established.
+          headers:
+            Set-Cookie:
+              description: |
+                `crm_session=<opaque>; HttpOnly; Secure; SameSite=Lax; Path=/`.
+                `Secure` is omitted only on plain-HTTP local development.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CurrentUser" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401":
+          description: |
+            Invalid credentials. Identical response for wrong password and
+            unknown account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                invalid:
+                  value:
+                    code: INVALID_CREDENTIALS
+                    message: Неверный логин или пароль.
+                    correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5c90
+        "403":
+          description: Credentials correct but the account is blocked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                blocked:
+                  value:
+                    code: ACCOUNT_BLOCKED
+                    message: Доступ к учётной записи заблокирован.
+                    correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5c91
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+    get:
+      operationId: getSession
+      tags: [Access]
+      summary: Current session and user
+      description: |
+        Used on application start to restore a session. Returns the same body
+        as sign-in. A revoked or expired session returns 401 so the client can
+        clear protected views and caches, per `frontend.md` FE-01.
+      responses:
+        "200":
+          description: Active session.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CurrentUser" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+
+    delete:
+      operationId: deleteSession
+      tags: [Access]
+      summary: Sign out
+      description: |
+        Revokes the current session server-side and clears the cookie.
+        Idempotent: signing out an already-ended session still returns 204, so
+        a client cannot be left unable to complete sign-out.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      responses:
+        "204":
+          description: |
+            Session ended. Also returned when there was no active session, so
+            a client can always complete sign-out.
+          headers:
+            Set-Cookie:
+              description: Expired cookie clearing `crm_session`.
+              schema: { type: string }
+        "403":
+          description: |
+            Missing or invalid CSRF token. Sign-out is idempotent with respect
+            to session state but still requires CSRF, so a third-party site
+            cannot force a user to be signed out.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /me:
+    get:
+      operationId: getCurrentUser
+      tags: [Access]
+      summary: Current user, capabilities and permitted locations
+      description: |
+        Authoritative source for what the signed-in actor may do. The frontend
+        uses it to decide which destinations and actions to render, but every
+        API denial must still be handled — `frontend.md` is explicit that UI
+        hiding is not enforcement.
+
+        Re-fetch after a permission change: grant updates invalidate affected
+        sessions or caches immediately (BE-02).
+      responses:
+        "200":
+          description: Current user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CurrentUser" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+
+  # ===========================================================================
+  # Metadata
+  # ===========================================================================
+  /meta/capabilities:
+    get:
+      operationId: listCapabilities
+      tags: [Metadata]
+      summary: Capability and role-preset catalogue
+      description: |
+        Drives the P02 permission editor without hard-coding capability names
+        in the frontend. Capability list follows `development/README.md`
+        section 7.
+
+        Role preset defaults are **not** settled: exactly what an
+        Administrator, Operator or Coach may do by default is D-04. Until
+        resolved, `presets` may be returned empty rather than guessed.
+        GATE D-04.
+      responses:
+        "200":
+          description: Catalogue.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [capabilities, presets]
+                properties:
+                  capabilities:
+                    type: array
+                    items: { $ref: "#/components/schemas/CapabilityDescriptor" }
+                  presets:
+                    type: array
+                    description: Empty until D-04 is resolved.
+                    items: { $ref: "#/components/schemas/RolePreset" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ===========================================================================
+  # Employees — P02 / BE-02
+  # ===========================================================================
+  /employees:
+    get:
+      operationId: listEmployees
+      tags: [Employees]
+      summary: List employees
+      description: |
+        Requires `employees.manage`. Results are scoped to locations the actor
+        may administer. Ordering is stable (`full_name`, then `id`) so
+        pagination cannot skip or repeat a row while data changes.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - name: query
+          in: query
+          description: Case-insensitive match on name. ICU collation handles Cyrillic.
+          schema: { type: string, maxLength: 200 }
+        - name: location_id
+          in: query
+          schema: { $ref: "#/components/schemas/Id" }
+        - name: access_state
+          in: query
+          schema: { $ref: "#/components/schemas/AccessState" }
+        - name: role
+          in: query
+          schema: { $ref: "#/components/schemas/RoleKey" }
+      responses:
+        "200":
+          description: Paginated employees.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageEnvelope"
+                  - type: object
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/EmployeeSummary" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+    post:
+      operationId: createEmployee
+      tags: [Employees]
+      summary: Create an employee
+      description: |
+        Requires `employees.manage`. The caller cannot set the initial
+        credential directly; onboarding and first-use flow are D-02, so this
+        operation creates the account and its grants only.
+
+        GATE D-02 for how the employee receives access.
+        GATE D-04 for which `role` values are accepted and what they imply.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmployeeWrite" }
+      responses:
+        "201":
+          description: Created.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Employee" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /employees/{employee_id}:
+    parameters:
+      - $ref: "#/components/parameters/EmployeeId"
+    get:
+      operationId: getEmployee
+      tags: [Employees]
+      summary: Employee detail
+      responses:
+        "200":
+          description: Employee.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Employee" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+    patch:
+      operationId: updateEmployee
+      tags: [Employees]
+      summary: Update an employee
+      description: |
+        Requires `employees.manage` and `If-Match`. Omitted fields are left
+        unchanged; `null` is not a way to clear a required field.
+
+        Removing the last active Power User is refused with
+        `LAST_POWER_USER_PROTECTED` — a system with no Power User cannot
+        restore its own administration.
+
+        Changing grants or access state revokes the affected employee's
+        sessions immediately. The response reports how many were ended so the
+        UI can state the consequence plainly instead of implying it.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EmployeeWrite" }
+      responses:
+        "200":
+          description: Updated.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Employee" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            Stale `If-Match` (`VERSION_CONFLICT`), or the change would remove
+            the last active Power User (`LAST_POWER_USER_PROTECTED`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                version:
+                  summary: Stale version
+                  value:
+                    code: VERSION_CONFLICT
+                    message: Запись изменена другим пользователем. Обновите данные.
+                    current_version: 7
+                    correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5c92
+                last_power_user:
+                  summary: Last Power User protected
+                  value:
+                    code: LAST_POWER_USER_PROTECTED
+                    message: Нельзя снять последнего пользователя с полными правами.
+                    correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5c93
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /employees/{employee_id}/archive:
+    parameters:
+      - $ref: "#/components/parameters/EmployeeId"
+    post:
+      operationId: archiveEmployee
+      tags: [Employees]
+      summary: Archive an employee
+      description: |
+        Archive, not delete. There is deliberately no hard-delete operation:
+        an employee is referenced as the actor on bookings, payments and audit
+        events, and removing the row would destroy that history.
+
+        Archiving blocks access and revokes sessions while preserving every
+        actor reference.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { $ref: "#/components/schemas/Reason" }
+      responses:
+        "200":
+          description: Archived.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Employee" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Stale version or last Power User protected.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /employees/{employee_id}/sessions:
+    parameters:
+      - $ref: "#/components/parameters/EmployeeId"
+    delete:
+      operationId: revokeEmployeeSessions
+      tags: [Employees]
+      summary: Revoke all sessions for an employee
+      description: |
+        Ends every active session for the employee across devices. Separate
+        from blocking: an administrator may need to end sessions without
+        removing access, for example on a lost device.
+
+        Verified by BE-01 acceptance — a blocked or revoked account cannot
+        continue using a previously issued session.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      responses:
+        "200":
+          description: Sessions revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked_session_count, server_time]
+                properties:
+                  revoked_session_count: { type: integer, minimum: 0 }
+                  server_time: { $ref: "#/components/schemas/Instant" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ===========================================================================
+  # Locations — P03 / BE-03
+  # ===========================================================================
+  /locations:
+    get:
+      operationId: listLocations
+      tags: [Locations]
+      summary: List locations
+      description: |
+        Returns only locations the actor may access. An ACE-only employee
+        never sees CSKA here, and must not be able to reach CSKA data by
+        supplying its ID elsewhere — AC-11.
+      parameters:
+        - name: include_archived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Permitted locations.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Location" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+
+    post:
+      operationId: createLocation
+      tags: [Locations]
+      summary: Create a location
+      description: Requires `locations.manage` (Power User).
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LocationWrite" }
+      responses:
+        "201":
+          description: Created.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Location" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /locations/{location_id}:
+    parameters:
+      - $ref: "#/components/parameters/LocationId"
+    get:
+      operationId: getLocation
+      tags: [Locations]
+      summary: Location detail
+      responses:
+        "200":
+          description: Location.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Location" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+    patch:
+      operationId: updateLocation
+      tags: [Locations]
+      summary: Update a location
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LocationWrite" }
+      responses:
+        "200":
+          description: Updated.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Location" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/VersionConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  # ===========================================================================
+  # Resources — P03 / BE-03
+  # ===========================================================================
+  /locations/{location_id}/resources:
+    parameters:
+      - $ref: "#/components/parameters/LocationId"
+    get:
+      operationId: listResources
+      tags: [Resources]
+      summary: List bookable resources at a location
+      description: |
+        Ordered by `display_order`, then `id`. The demo showed ten tennis
+        courts plus Fitness and Assembly Hall at ACE; actual inventory is
+        imported only after validation (BE-03).
+      parameters:
+        - name: include_archived
+          in: query
+          schema: { type: boolean, default: false }
+        - name: kind
+          in: query
+          schema: { $ref: "#/components/schemas/ResourceKind" }
+      responses:
+        "200":
+          description: Resources.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Resource" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+    post:
+      operationId: createResource
+      tags: [Resources]
+      summary: Create a resource
+      description: |
+        Requires `resources.manage` for the location. The resource belongs to
+        the location in the path; a mismatched `location_id` in the body is
+        refused with `RESOURCE_LOCATION_MISMATCH` rather than silently
+        preferring one of the two.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResourceWrite" }
+      responses:
+        "201":
+          description: Created.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Resource" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /resources/{resource_id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      operationId: getResource
+      tags: [Resources]
+      summary: Resource detail
+      responses:
+        "200":
+          description: Resource.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Resource" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+    patch:
+      operationId: updateResource
+      tags: [Resources]
+      summary: Update a resource
+      description: |
+        Archiving a resource with future allocations must follow approved
+        policy and cannot silently cancel paid bookings (BE-03). Where the
+        change would affect existing reservations the server returns
+        actionable detail rather than applying it quietly.
+
+        GATE D-06 for how closures and archival interact with existing
+        bookings.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResourceWrite" }
+      responses:
+        "200":
+          description: Updated.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Resource" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/VersionConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /resources/{resource_id}/closures:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      operationId: listResourceClosures
+      tags: [Resources]
+      summary: List closures for a resource
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/LocalDate" }
+        - name: to
+          in: query
+          required: true
+          description: Inclusive. Interpreted in the location's business timezone.
+          schema: { $ref: "#/components/schemas/LocalDate" }
+      responses:
+        "200":
+          description: Closures.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Closure" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+    post:
+      operationId: createResourceClosure
+      tags: [Resources]
+      summary: Close a resource for a period
+      description: |
+        Closures use half-open instants `[starts_at, ends_at)`, the same
+        convention as reservations, so a closure ending at 11:00 does not
+        collide with a booking starting at 11:00.
+
+        If the period overlaps existing confirmed bookings the server returns
+        409 `CLOSURE_CONFLICTS_BOOKINGS` listing them, rather than cancelling
+        them. Resolving those bookings is a separate, deliberate act.
+
+        From S3 this shares the BE-06 allocation engine, so a closure and a
+        booking cannot both claim the same interval.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ClosureWrite" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Closure" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The period overlaps existing bookings.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    properties:
+                      conflicts:
+                        type: array
+                        description: Conflicting allocations, so the UI can name exact dates.
+                        items:
+                          type: object
+                          properties:
+                            reservation_id: { $ref: "#/components/schemas/Id" }
+                            starts_at: { $ref: "#/components/schemas/Instant" }
+                            ends_at: { $ref: "#/components/schemas/Instant" }
+              examples:
+                conflict:
+                  value:
+                    code: CLOSURE_CONFLICTS_BOOKINGS
+                    message: В выбранный период есть подтверждённые брони.
+                    correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5c94
+                    conflicts:
+                      - reservation_id: 4821
+                        starts_at: "2026-11-02T04:00:00Z"
+                        ends_at: "2026-11-02T05:30:00Z"
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: crm_session
+      description: |
+        Opaque session identifier in a `Secure`, `HttpOnly`, `SameSite=Lax`
+        cookie. Not readable by client JavaScript, which is why no token
+        appears in any response body.
+
+        State-changing requests additionally require the CSRF header — see the
+        `CsrfToken` parameter. `SameSite=Lax` alone is not treated as
+        sufficient protection.
+
+        GATE D-01 for the final session strategy, cookie domain and CORS
+        details, which depend on the chosen framework and deployment.
+
+  parameters:
+    CsrfToken:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      description: |
+        CSRF token for state-changing requests, paired with the session
+        cookie. Required on every POST, PATCH and DELETE.
+      schema: { type: string, minLength: 1 }
+
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: |
+        `ETag` from the last read of this record. A stale value fails with
+        409 `VERSION_CONFLICT` and the response carries `current_version`, so
+        the client can show a conflict rather than overwrite another user's
+        change.
+      schema: { type: string }
+      example: '"7"'
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Client-generated key for duplicate-prone commands. The server binds it
+        to actor, operation and request digest, and a retry returns the
+        original committed result. Reusing a key with different input is a
+        conflict.
+
+        Defined here for reuse; applies from S3 to reservation requests,
+        financial commands, membership activation and attendance, per
+        `development/README.md` section 8. No S1 operation needs it.
+      schema: { type: string, format: uuid }
+
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+
+    EmployeeId:
+      name: employee_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Id" }
+
+    LocationId:
+      name: location_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Id" }
+
+    ResourceId:
+      name: resource_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Id" }
+
+  headers:
+    ETag:
+      description: Opaque record version for use in `If-Match`.
+      schema: { type: string }
+
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema: { type: integer, minimum: 0 }
+
+  responses:
+    NotAuthenticated:
+      description: No valid session.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            default:
+              value:
+                code: NOT_AUTHENTICATED
+                message: Войдите в систему.
+                correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5ca0
+
+    Forbidden:
+      description: |
+        Authenticated but not permitted. The message must not disclose the
+        name or existence of the hidden record — `ui-ux.md` section 10.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            default:
+              value:
+                code: FORBIDDEN
+                message: Недостаточно прав для этого действия.
+                correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5ca1
+
+    NotFound:
+      description: |
+        Record absent, or concealed from this actor. Section 8 permits 404 in
+        place of 403 where ownership must stay concealed; the choice must be
+        consistent per operation so response codes cannot be used to probe
+        for existence.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+    ValidationFailed:
+      description: Invalid input. `field_errors` maps field path to messages.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            default:
+              value:
+                code: VALIDATION_FAILED
+                message: Проверьте заполненные поля.
+                field_errors:
+                  closes_at: ["Окончание должно быть позже начала."]
+                correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5ca2
+
+    VersionConflict:
+      description: Stale `If-Match`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            default:
+              value:
+                code: VERSION_CONFLICT
+                message: Запись изменена другим пользователем. Обновите данные.
+                current_version: 4
+                correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5ca3
+
+    RateLimited:
+      description: Too many attempts.
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            default:
+              value:
+                code: RATE_LIMITED
+                message: Слишком много попыток. Повторите позже.
+                correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5ca4
+
+  schemas:
+    # --- primitives ---------------------------------------------------------
+    Id:
+      type: integer
+      format: int64
+      minimum: 1
+      description: Server-assigned identifier. Never supplied by a client on create.
+
+    Instant:
+      type: string
+      format: date-time
+      description: |
+        ISO 8601 instant with offset, normally UTC. Business display and report
+        boundaries use `Asia/Almaty`, applied by the consumer, not encoded here.
+      examples: ["2026-10-25T08:30:00Z"]
+
+    LocalDate:
+      type: string
+      format: date
+      description: |
+        Calendar date with no time or offset. Used where a date must not shift
+        under timezone conversion — birth dates and tariff effective dates in
+        later sprints.
+      examples: ["2026-10-25"]
+
+    LocalTime:
+      type: string
+      pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+      description: Local wall-clock time in the location's business timezone.
+      examples: ["07:00"]
+
+    Version:
+      type: integer
+      minimum: 1
+      description: Increments on every committed change. Mirrors the `ETag`.
+
+    Reason:
+      type: string
+      maxLength: 1000
+      description: |
+        Free-text reason recorded on the audit event. Whether a reason is
+        required per operation follows API policy — `ui-ux.md` section 6 is
+        explicit that a designer must not require one by assumption.
+
+    Error:
+      type: object
+      required: [code, message, correlation_id]
+      description: |
+        Single error shape, from `development/README.md` section 8. Carries no
+        stack trace and no personal data.
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable code. Clients branch on this, never on `message`.
+        message:
+          type: string
+          description: Russian text safe to display to this actor.
+        field_errors:
+          type: object
+          description: Field path to messages, for form-level display.
+          additionalProperties:
+            type: array
+            items: { type: string }
+        current_version:
+          $ref: "#/components/schemas/Version"
+        correlation_id:
+          type: string
+          description: Request correlation reference for support, safe to show to a user.
+
+    PageEnvelope:
+      type: object
+      required: [total, limit, offset]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+          description: |
+            All records matching the filter, not the page. Section 8 requires
+            summary totals to cover the whole filtered set; pagination must
+            never change an aggregate.
+        limit: { type: integer }
+        offset: { type: integer }
+
+    # --- access -------------------------------------------------------------
+    AccessState:
+      type: string
+      enum: [active, blocked, archived]
+      description: |
+        `blocked` and `archived` both end sessions and prevent sign-in.
+        Archived additionally removes the employee from new assignment while
+        preserving every actor reference on historical records.
+
+    RoleKey:
+      type: string
+      enum: [power_user, administrator, operator, coach, customer]
+      description: |
+        Role presets from `development/README.md` section 7. `power_user` is
+        the highest authority; the demo called this role Owner.
+
+        A role is a preset for granting capabilities, not the authorization
+        mechanism. Authorization is evaluated from explicit grants plus
+        location and ownership scope, so absence of a grant means denial even
+        for a high-ranking role. GATE D-04 for preset defaults.
+
+    Capability:
+      type: string
+      description: |
+        Capability key from `development/README.md` section 7. Not an enum
+        here on purpose: the set grows each sprint, and pinning it in S1 would
+        force a contract change for every new grant. Treat as an opaque
+        string and fetch the catalogue from `/meta/capabilities`.
+      examples: ["reservations.confirm"]
+
+    CapabilityDescriptor:
+      type: object
+      required: [key, label, location_scoped]
+      properties:
+        key: { $ref: "#/components/schemas/Capability" }
+        label: { type: string, description: Russian display label. }
+        group: { type: string, description: Grouping for the permission editor. }
+        location_scoped:
+          type: boolean
+          description: Whether the grant is evaluated per location.
+        power_user_only:
+          type: boolean
+          description: |
+            Capability that cannot be delegated. Delegation policy is D-04.
+
+    RolePreset:
+      type: object
+      required: [role, label, capabilities]
+      properties:
+        role: { $ref: "#/components/schemas/RoleKey" }
+        label: { type: string }
+        capabilities:
+          type: array
+          items: { $ref: "#/components/schemas/Capability" }
+
+    CurrentUser:
+      type: object
+      required: [id, full_name, role, capabilities, locations, server_time]
+      description: |
+        Everything the client needs to choose a navigation shell and render
+        permitted actions. `ui-ux.md` section 2 defines three shells: staff,
+        customer and coach.
+      properties:
+        id: { $ref: "#/components/schemas/Id" }
+        full_name: { type: string }
+        role: { $ref: "#/components/schemas/RoleKey" }
+        capabilities:
+          type: array
+          description: |
+            Effective capabilities after presets, explicit grants and scope.
+            The frontend uses these to decide what to show; the server still
+            enforces every call independently.
+          items: { $ref: "#/components/schemas/Capability" }
+        locations:
+          type: array
+          description: |
+            Permitted locations only. An ACE-only employee receives ACE alone,
+            and must not reach CSKA by supplying its ID elsewhere — AC-11.
+          items: { $ref: "#/components/schemas/LocationSummary" }
+        customer_id:
+          description: |
+            Set when the account is linked to a customer identity, for the
+            customer shell. Linking requires verified ownership or an
+            authorized employee action: a matching phone number alone must
+            never link an account to an existing customer (BE-01).
+          oneOf:
+            - $ref: "#/components/schemas/Id"
+            - type: "null"
+        coach_id:
+          description: Set when the account is linked to a coach profile.
+          oneOf:
+            - $ref: "#/components/schemas/Id"
+            - type: "null"
+        must_change_password:
+          type: boolean
+          description: |
+            True after bootstrap or a reset, so the client can route to a
+            change-password step. GATE D-02 for the full first-use flow.
+        server_time:
+          $ref: "#/components/schemas/Instant"
+
+    # --- employees ----------------------------------------------------------
+    EmployeeSummary:
+      type: object
+      required: [id, full_name, role, access_state, locations, version]
+      properties:
+        id: { $ref: "#/components/schemas/Id" }
+        full_name: { type: string }
+        role: { $ref: "#/components/schemas/RoleKey" }
+        access_state: { $ref: "#/components/schemas/AccessState" }
+        locations:
+          type: array
+          items: { $ref: "#/components/schemas/LocationSummary" }
+        version: { $ref: "#/components/schemas/Version" }
+
+    Employee:
+      allOf:
+        - $ref: "#/components/schemas/EmployeeSummary"
+        - type: object
+          required: [capabilities, created_at]
+          properties:
+            phone:
+              description: Display value as entered. Normalized separately for search (BE-04).
+              oneOf:
+                - type: string
+                - type: "null"
+            capabilities:
+              type: array
+              description: Explicit grants. Effective permissions combine these with the preset.
+              items: { $ref: "#/components/schemas/Capability" }
+            coach_id:
+              description: |
+                Linked coach profile, if any. A coach's business profile and
+                login identity are separate linked records, never one row.
+              oneOf:
+                - $ref: "#/components/schemas/Id"
+                - type: "null"
+            active_session_count:
+              type: integer
+              minimum: 0
+              description: Lets the UI state plainly how many sessions a change will end.
+            created_at: { $ref: "#/components/schemas/Instant" }
+            archived_at:
+              oneOf:
+                - $ref: "#/components/schemas/Instant"
+                - type: "null"
+
+    EmployeeWrite:
+      type: object
+      additionalProperties: false
+      description: |
+        Create and update payload. On update, omitted fields are unchanged.
+        `access_state` cannot be set to `archived` here — use the archive
+        operation, so the action is explicit and auditable.
+      properties:
+        full_name: { type: string, minLength: 1, maxLength: 200 }
+        phone: { type: string, maxLength: 32 }
+        identifier:
+          type: string
+          maxLength: 320
+          description: Sign-in identifier. GATE D-02.
+        role: { $ref: "#/components/schemas/RoleKey" }
+        access_state:
+          type: string
+          enum: [active, blocked]
+        location_ids:
+          type: array
+          description: |
+            Assigned locations. Determines the scope of every location-scoped
+            capability. An empty array means no location access.
+          items: { $ref: "#/components/schemas/Id" }
+        capabilities:
+          type: array
+          description: Explicit grants in addition to the preset. GATE D-04.
+          items: { $ref: "#/components/schemas/Capability" }
+        coach_id:
+          oneOf:
+            - $ref: "#/components/schemas/Id"
+            - type: "null"
+        reason: { $ref: "#/components/schemas/Reason" }
+
+    # --- locations ----------------------------------------------------------
+    LocationSummary:
+      type: object
+      required: [id, name]
+      properties:
+        id: { $ref: "#/components/schemas/Id" }
+        name: { type: string, examples: ["ACE"] }
+
+    Location:
+      type: object
+      required: [id, name, timezone, is_active, version]
+      properties:
+        id: { $ref: "#/components/schemas/Id" }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        timezone:
+          type: string
+          description: |
+            IANA timezone for business display, report boundaries and
+            recurrence expansion at this location. `Asia/Almaty` for both ACE
+            and CSKA.
+
+            Per-location rather than global because report boundaries must
+            follow the location, not the workstation — and a future third
+            location should not require a schema change.
+          examples: ["Asia/Almaty"]
+        address:
+          oneOf:
+            - type: string
+            - type: "null"
+        is_active: { type: boolean }
+        version: { $ref: "#/components/schemas/Version" }
+
+    LocationWrite:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        timezone: { type: string }
+        address: { type: string, maxLength: 500 }
+        is_active: { type: boolean }
+        reason: { $ref: "#/components/schemas/Reason" }
+
+    # --- resources ----------------------------------------------------------
+    ResourceKind:
+      type: string
+      enum: [tennis_court, fitness, hall, other]
+      description: |
+        Bookable resource kind. Values follow the demo inventory: ten tennis
+        courts plus Fitness and Assembly Hall at ACE.
+
+        `frontend.md` FE-03 requires kinds whose customer-facing scope is
+        unsettled to be hidden from customer booking until agreed, so this is
+        not automatically a customer-selectable list.
+
+    SurfacePlacement:
+      type: string
+      enum: [indoor, outdoor]
+      description: Indoor or outdoor. Meaningful for courts; may be absent otherwise.
+
+    OpeningHours:
+      type: object
+      required: [weekday, opens_at, closes_at, closes_next_day]
+      description: |
+        Operating hours for one weekday in the location's timezone. Courts run
+        07:00–00:00.
+
+        `closes_next_day` exists because a 00:00 close belongs to the next
+        calendar date. Encoding it as a flag rather than a `24:00` string
+        keeps `closes_at` a valid time that every client can parse, and makes
+        the midnight case explicit instead of implied. Proposed — confirm in
+        S0 review.
+      properties:
+        weekday:
+          type: integer
+          minimum: 1
+          maximum: 7
+          description: ISO-8601 weekday, Monday = 1.
+        opens_at: { $ref: "#/components/schemas/LocalTime" }
+        closes_at: { $ref: "#/components/schemas/LocalTime" }
+        closes_next_day:
+          type: boolean
+          description: True when `closes_at` falls on the following date, e.g. 00:00.
+
+    Resource:
+      type: object
+      required: [id, location_id, name, kind, display_order, is_active, opening_hours, version]
+      properties:
+        id: { $ref: "#/components/schemas/Id" }
+        location_id: { $ref: "#/components/schemas/Id" }
+        name: { type: string, examples: ["Корт 1"] }
+        kind: { $ref: "#/components/schemas/ResourceKind" }
+        placement:
+          oneOf:
+            - $ref: "#/components/schemas/SurfacePlacement"
+            - type: "null"
+        display_order:
+          type: integer
+          description: Column order in the P09 schedule. Stable tiebreak is `id`.
+        default_capacity:
+          description: |
+            Baseline participant capacity. Default is at most 12 per court and
+            overcapacity is blocked (BR-13).
+
+            How capacity behaves when a group spans several courts is **not**
+            settled and must not be assumed to be 12 times the resource count.
+            GATE D-12.
+          oneOf:
+            - type: integer
+              minimum: 1
+            - type: "null"
+        is_active: { type: boolean }
+        opening_hours:
+          type: array
+          items: { $ref: "#/components/schemas/OpeningHours" }
+        version: { $ref: "#/components/schemas/Version" }
+        archived_at:
+          oneOf:
+            - $ref: "#/components/schemas/Instant"
+            - type: "null"
+
+    ResourceWrite:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        kind: { $ref: "#/components/schemas/ResourceKind" }
+        placement: { $ref: "#/components/schemas/SurfacePlacement" }
+        display_order: { type: integer, minimum: 0 }
+        default_capacity: { type: integer, minimum: 1 }
+        is_active: { type: boolean }
+        opening_hours:
+          type: array
+          items: { $ref: "#/components/schemas/OpeningHours" }
+        reason: { $ref: "#/components/schemas/Reason" }
+
+    Closure:
+      type: object
+      required: [id, resource_id, starts_at, ends_at]
+      properties:
+        id: { $ref: "#/components/schemas/Id" }
+        resource_id: { $ref: "#/components/schemas/Id" }
+        starts_at: { $ref: "#/components/schemas/Instant" }
+        ends_at:
+          allOf:
+            - $ref: "#/components/schemas/Instant"
+            - description: Exclusive. Half-open `[starts_at, ends_at)`, as for reservations.
+        reason:
+          oneOf:
+            - type: string
+            - type: "null"
+        created_at:
+          $ref: "#/components/schemas/Instant"
+
+    ClosureWrite:
+      type: object
+      required: [starts_at, ends_at]
+      additionalProperties: false
+      properties:
+        starts_at: { $ref: "#/components/schemas/Instant" }
+        ends_at: { $ref: "#/components/schemas/Instant" }
+        reason: { $ref: "#/components/schemas/Reason" }

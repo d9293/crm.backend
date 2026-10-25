@@ -1,0 +1,20 @@
+# Contract lint configuration. Used by the INF-01 CI job so a drifted or
+# invalid OpenAPI document fails before merge rather than surfacing as a
+# runtime mismatch during S3 integration.
+#
+#   npx @redocly/cli lint
+
+apis:
+  crm@v1:
+    root: api/openapi.yaml
+
+extends:
+  - recommended
+
+rules:
+  # Intentional. Idempotency-Key is part of the S0 cross-team conventions and
+  # is documented in components so both teams agree its semantics now, but no
+  # S1 operation needs it — it applies from S3 to reservation requests,
+  # financial commands, membership activation and attendance. Deleting it to
+  # satisfy the linter would drop an agreed convention from the contract.
+  no-unused-components: off
