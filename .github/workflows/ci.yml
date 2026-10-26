@@ -1,0 +1,85 @@
+# INF-01 — backend verification.
+#
+# The application test and migration jobs do not exist yet: D-01 has not fixed
+# the language, and development/README.md forbids scaffolding a framework
+# before it is resolved. What CAN be verified today is the API contract, so
+# that is what this workflow does.
+#
+# When D-01 lands, BE-00 adds:
+#   - dependency install from a lockfile, lint, typecheck
+#   - migrations applied against an empty PostgreSQL service container
+#   - integration tests against real PostgreSQL, since SQLite and mocks cannot
+#     validate the exclusion constraint, row locking or the AC-01 to AC-03
+#     booking races
+#   - a check that model definitions and migration history have not diverged
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: API contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Zero errors AND zero warnings. redocly.yaml records which rules are
+      # deliberately disabled and why, so a warning here means something new.
+      - name: Lint contract
+        run: npx --yes @redocly/cli@2.26.0 lint
+
+      # A contract that lints but cannot generate types is useless to the
+      # frontend, so generation is exercised here. Output location comes from
+      # redocly.yaml: openapi-typescript reads that file too and ignores -o
+      # when it does.
+      #
+      # Generated twice and diffed, because the frontend commits its copy as a
+      # vendored contract — a non-deterministic generator would make that copy
+      # impossible to verify.
+      - name: Verify type generation succeeds and is deterministic
+        run: |
+          set -euo pipefail
+          npx --yes openapi-typescript@7.13.0
+          cp api/.generated/schema.d.ts first.d.ts
+          npx --yes openapi-typescript@7.13.0
+          diff -u first.d.ts api/.generated/schema.d.ts
+          test -s api/.generated/schema.d.ts
+          echo "Type generation succeeds and is deterministic."
+
+      # Guards the convention that a breaking change takes a new major path
+      # rather than an edit in place: the frontend builds its types from this
+      # file, so a silently incompatible v1 would break it at runtime.
+      - name: Assert the contract still declares /api/v1
+        run: |
+          set -euo pipefail
+          if ! grep -q 'url: /api/v1' api/openapi.yaml; then
+            echo "::error::Base path is no longer /api/v1. A breaking change needs a new major path, not an edit in place."
+            exit 1
+          fi
+
+      # No secret may appear in the contract or its examples.
+      - name: Scan for credentials in the contract
+        run: |
+          set -euo pipefail
+          if grep -nEi '(password|secret|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/+_-]{12,}' api/openapi.yaml; then
+            echo "::error::Possible credential literal in the contract."
+            exit 1
+          fi
+          echo "No credential literals found."

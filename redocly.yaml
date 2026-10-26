@@ -7,6 +7,15 @@
 apis:
   crm@v1:
     root: api/openapi.yaml
+    # openapi-typescript also reads this file, and in config mode it requires
+    # an output key and ignores the CLI -o argument. Declaring it here keeps
+    # the two tools consistent instead of failing with a confusing error.
+    #
+    # This path is a scratch target for the CI codegen smoke check only. The
+    # frontend generates its own committed copy via `npm run api:types`, run
+    # from that repository where this config is not in scope.
+    x-openapi-ts:
+      output: api/.generated/schema.d.ts
 
 extends:
   - recommended

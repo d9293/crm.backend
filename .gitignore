@@ -52,3 +52,7 @@ Desktop.ini
 
 # Redocly / npx cache
 node_modules/
+
+# openapi-typescript CI scratch output
+api/.generated/
+first.d.ts
