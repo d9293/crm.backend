@@ -15,6 +15,8 @@ Versioned OpenAPI contract for the ACE / CSKA CRM. `development/README.md` §3 p
 | S3 | P07 Customer request | `POST /reservations/requests` |
 | S3 | P08/P09 Reads | `GET /reservations`, `GET /reservations/{id}` |
 | S3 | P10 Approval queue | `POST /reservations/{id}/confirm`, `/reject` |
+| S4 | P08 Customer cancellation | `POST /reservations/{id}/cancellation-requests` |
+| S4 | P11 Administrator queue | `GET /cancellation-requests`, `.../approve`, `.../reject` |
 
 Written before the server exists, deliberately: `development/README.md` §3 requires each sprint to begin with contract examples agreed by both teams, and the contract is language-neutral, so it is not blocked by D-01.
 
@@ -72,7 +74,7 @@ Three shapes were chosen where the specification left room. Each is a question f
 
 **5. Allowed durations.** `GET /availability` returns the permitted durations rather than letting a client offer arbitrary intervals. The demo offered 30 minutes to five hours in half-hour steps; the real list, and any per-customer limit, is D-06.
 
-### Deliberately absent from S3
+### Deliberately absent
 
 Not oversights — each needs a decision before it can be specified:
 
@@ -81,12 +83,16 @@ Not oversights — each needs a decision before it can be specified:
 | Staff-created reservations (immediate vs approval) | D-06 |
 | Customer withdrawal of a pending request | D-06 |
 | Active-hold and advance-booking limits | D-06 |
+| Administrator decisions after the cutoff or after start | D-07 |
+| Customer resubmission after a rejected cancellation | D-07 |
+| Cancellation interaction with rescheduling; staff override | D-07 |
+| No-show and completion handling | D-07 |
 | Multiple courts as *alternatives* rather than all-together | D-08 |
-| Recurrence and rescheduling | D-08 (S4) |
-| Cancellation request and decision | D-07 (S4) |
+| Recurrence and rescheduling | D-08 |
+| Financial consequences of a cancellation | D-09 |
 | Structured pricing units and duration-based tariffs | D-10 |
 
-`CancellationState` **is** declared, even though the S4 endpoints are not. A confirmed reservation with a pending cancellation is a state S3 clients must already render correctly (UX-04), and declaring the enum now avoids a contract change to do it.
+`can_decide` on a cancellation request answers only *this actor, this request, now*. It must not be read as settling who may decide after the cutoff — that is D-07.
 
 ## The hold mechanism
 
@@ -107,10 +113,29 @@ The S3 endpoints carry the system's hardest correctness requirements. What the c
 
 `can_confirm` deserves a note: it exists so the *server* decides whether a decision is still possible. A client comparing timestamps itself would get it wrong under clock skew, and `ui-ux.md` §6 requires decision buttons to disappear at server expiry.
 
+## The cancellation cutoff
+
+The S4 rules are confirmed (BR-07, BR-08, BR-09) and encoded the same way the hold is — structurally, not just described:
+
+| Rule | Where it is encoded |
+|---|---|
+| Accepted up to **exactly** 2 hours before start | `now <= starts_at - 2h`. For a 15:00 start, 13:00:00 passes and 13:00:01 does not (AC-05) |
+| Enforced at **submission**, not page load | The server re-evaluates on every request; a form opened early and submitted late is refused |
+| The client never computes the deadline | `cancellation_cutoff_at` and `can_request_cancellation` are both server-supplied, so a skewed clock cannot show the wrong deadline or offer an expired action (UX-03) |
+| A pending request keeps the court | The reservation stays `confirmed`; `cancellation_request_state` is a *separate* field, never merged into reservation state (BR-08, UX-04) |
+| One active request per reservation | A duplicate submission returns the existing record, so a double-tap cannot fill the queue |
+| Approval releases the slot exactly once | One transaction records the decision, cancels the reservation and frees allocations; a repeat approval is refused |
+| Rejection changes nothing | Booking stays confirmed and occupied |
+| **No money moves, either way** | BR-09. Approval touches no payment, charge or payroll; `ui-ux.md` §7 forbids an implicit refund checkbox |
+| No second timeout | A cancellation request has no expiry of its own; the queue orders by how soon the *booking* starts |
+
+`reservation_starts_at` is stored **on the request**, so a later reschedule cannot silently change what the customer asked to cancel.
+
 ## Changelog
 
 | Version | Date | Change |
 |---|---|---|
+| 0.3.0 | 26 October 2026 | S4 cancellation: customer request with the two-hour cutoff, administrator approve/reject |
 | 0.2.0 | 26 October 2026 | S3 booking core: availability, customer request with five-minute hold, employee confirm/reject |
 | 0.1.0 | 25 October 2026 | Initial S1 draft for contract review |
 

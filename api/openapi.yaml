@@ -2,8 +2,8 @@ openapi: 3.1.0
 
 info:
   title: ACE / CSKA CRM API
-  version: 0.2.0
-  summary: Sprints S1 and S3 — access, directory, availability and reservation holds.
+  version: 0.3.0
+  summary: Sprints S1, S3 and S4 — access, directory, holds and cancellation.
   description: |
     Versioned API contract for the ACE / CSKA tennis-centre CRM.
 
@@ -14,10 +14,13 @@ info:
     - **S3** — P07 availability and customer request, P09 schedule reads,
       P10 reservation approval queue. This is the confirmed customer journey:
       request, five-minute hold, employee decision (BR-04, BR-05, BR-06).
+    - **S4** — P08 customer cancellation request and P11 administrator
+      decision queue. Confirmed rules BR-07, BR-08 and BR-09: a request at
+      least two hours before start, administrator approval, the slot held
+      while pending, and no automatic refund.
 
-    S2 directory and catalog, S4 cancellation and the later financial sprints
-    extend this document; `development/README.md` section 4 holds the full
-    page inventory.
+    S2 directory and catalog and the later financial sprints extend this
+    document; `development/README.md` section 4 holds the full page inventory.
 
     This is a proposal for both teams to agree, not an owner-approved business
     rule set. Where a shape depends on an unresolved decision, the affected
@@ -107,6 +110,11 @@ tags:
     description: |
       Customer request, five-minute hold and employee decision. Pages P07–P10.
       Confirmed rules BR-04, BR-05 and BR-06; acceptance tests AC-01 to AC-04.
+  - name: Cancellations
+    description: |
+      Customer cancellation request and administrator decision. Pages P08 and
+      P11. Confirmed rules BR-07, BR-08 and BR-09; acceptance tests AC-05 and
+      AC-06.
 
 security:
   - sessionCookie: []
@@ -1050,6 +1058,9 @@ paths:
                     # authorized operator returns true for both.
                     can_confirm: false
                     can_reject: false
+                    # Cancellation applies to a confirmed booking, not a
+                    # pending request.
+                    can_request_cancellation: false
                     version: 1
         "200":
           description: |
@@ -1262,6 +1273,260 @@ paths:
               schema: { $ref: "#/components/schemas/ReservationConflictError" }
         "422": { $ref: "#/components/responses/ValidationFailed" }
 
+  # ===========================================================================
+  # Cancellation — P08, P11 / BE-08
+  # ===========================================================================
+  /reservations/{reservation_id}/cancellation-requests:
+    parameters:
+      - $ref: "#/components/parameters/ReservationId"
+    post:
+      operationId: createCancellationRequest
+      tags: [Cancellations]
+      summary: Customer requests cancellation of a confirmed reservation
+      description: |
+        Confirmed behaviour (BR-07, BR-08): a customer may request cancellation
+        at least two hours before the reservation starts, an administrator
+        decides, and the slot stays reserved while the request is pending.
+
+        **The cutoff is enforced on the server, at submission.** The condition
+        is `database_now <= starts_at - 2 hours`. For a 15:00 start, 13:00:00
+        is accepted and 13:00:01 is not (AC-05). A customer who opened the form
+        before the cutoff and submits after it is refused — the client's own
+        clock and the moment the page loaded are both irrelevant.
+
+        **The reservation does not change state.** It remains `confirmed` and
+        keeps occupying its resources until a decision is made, so a pending
+        request must never be displayed as though the booking were already
+        cancelled or uncertain (BR-08, UX-04).
+
+        **At most one active request per reservation.** A duplicate submission
+        returns the existing request rather than creating a second, so a
+        double-tap cannot produce two queue entries.
+
+        **No money moves.** BR-09 is explicit that cancellation does not
+        refund. This operation touches no payment, charge or entitlement.
+
+        Whether a customer may resubmit after a rejection, and how a pending
+        request interacts with rescheduling, are **D-07**. Do not infer either.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  allOf:
+                    - $ref: "#/components/schemas/Reason"
+                    - description: |
+                        Customer's comment. Whether it is required is agreed
+                        validation, not a designer's assumption.
+      responses:
+        "201":
+          description: Request submitted. The reservation remains confirmed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CancellationRequest" }
+              examples:
+                pending:
+                  value:
+                    id: 311
+                    reservation_id: 5120
+                    state: pending
+                    requested_at: "2026-10-26T07:45:00Z"
+                    reservation_starts_at: "2026-10-26T10:00:00Z"
+                    cancellation_cutoff_at: "2026-10-26T08:00:00Z"
+                    reason: Не смогу прийти
+                    server_time: "2026-10-26T07:45:00Z"
+                    can_decide: false
+                    version: 1
+        "200":
+          description: |
+            An active request already exists. The existing record is returned
+            rather than a second one being created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CancellationRequest" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403":
+          description: |
+            The caller lacks `cancellations.request_own`, or the reservation
+            belongs to another customer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            `CANCELLATION_CUTOFF_PASSED` — submission is later than
+            `starts_at - 2 hours`. The response carries both `server_time` and
+            `cancellation_cutoff_at` so the UI can explain precisely what was
+            missed instead of blaming the user vaguely.
+
+            `INVALID_TRANSITION` — the reservation is not confirmed; a pending,
+            rejected, expired or already-cancelled booking cannot be
+            cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CancellationCutoffError" }
+              examples:
+                too_late:
+                  value:
+                    code: CANCELLATION_CUTOFF_PASSED
+                    message: Отменить бронь можно не позднее чем за 2 часа до начала.
+                    correlation_id: 018f3a2c-7b11-7c3e-9a44-6d2f1b8e5cc0
+                    server_time: "2026-10-26T08:00:01Z"
+                    cancellation_cutoff_at: "2026-10-26T08:00:00Z"
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+
+  /cancellation-requests:
+    get:
+      operationId: listCancellationRequests
+      tags: [Cancellations]
+      summary: Cancellation requests within the caller's scope
+      description: |
+        Serves the P11 administrator queue, and a customer's view of their own
+        requests. Scope comes from the session: a customer sees only their own,
+        an administrator only permitted locations.
+
+        Default ordering is by `reservation_starts_at` ascending — the booking
+        starting soonest needs a decision soonest. This differs from the
+        reservation approval queue, which orders by hold expiry, because a
+        cancellation request has no expiry of its own. `README.md` section 6 is
+        explicit that no second timeout should be invented for it.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - name: location_id
+          in: query
+          schema: { $ref: "#/components/schemas/Id" }
+        - name: state
+          in: query
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/CancellationState" }
+          style: form
+          explode: false
+      responses:
+        "200":
+          description: Paginated cancellation requests.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PageEnvelope"
+                  - type: object
+                    required: [items, server_time]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/CancellationRequest" }
+                      server_time: { $ref: "#/components/schemas/Instant" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /cancellation-requests/{cancellation_request_id}/approve:
+    parameters:
+      - $ref: "#/components/parameters/CancellationRequestId"
+    post:
+      operationId: approveCancellationRequest
+      tags: [Cancellations]
+      summary: Administrator approves a cancellation
+      description: |
+        Requires `cancellations.decide` and permission for the reservation's
+        location — Administrator or Power User.
+
+        One transaction records the decision, transitions the reservation to
+        `canceled` and releases **all** its allocations, so the slot becomes
+        bookable immediately rather than at the next sweep (BR-08).
+
+        **No money moves.** BR-09: approval does not refund, write off debt, or
+        touch payroll. Any financial consequence is a separate, explicit act
+        governed by D-09. The confirmation UI must say so rather than offering
+        an implicit refund checkbox.
+
+        A duplicate approval must not release resources twice or emit duplicate
+        events; the committed decision is returned instead.
+
+        Whether an administrator may decide after the cutoff — or after the
+        reservation has started — is **D-07**, as is staff override. Those
+        paths are not specified here.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { $ref: "#/components/schemas/Reason" }
+      responses:
+        "200":
+          description: |
+            Approved. The reservation is `canceled` and its resources are free.
+            Any payment it had is unaffected and remains in financial totals.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CancellationRequest" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            `INVALID_TRANSITION` — already decided by another administrator.
+
+            `VERSION_CONFLICT` — stale `If-Match`, including the case where the
+            underlying booking changed since the request was read.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /cancellation-requests/{cancellation_request_id}/reject:
+    parameters:
+      - $ref: "#/components/parameters/CancellationRequestId"
+    post:
+      operationId: rejectCancellationRequest
+      tags: [Cancellations]
+      summary: Administrator rejects a cancellation
+      description: |
+        Records the decision and leaves the reservation exactly as it was:
+        still `confirmed`, still occupying its resources (BR-08). No money
+        moves in either direction.
+
+        Whether the customer may submit a new request afterwards is **D-07**.
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { $ref: "#/components/schemas/Reason" }
+      responses:
+        "200":
+          description: Rejected. The booking is untouched.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CancellationRequest" }
+        "401": { $ref: "#/components/responses/NotAuthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Already decided, or stale `If-Match`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
 components:
   securitySchemes:
     sessionCookie:
@@ -1347,6 +1612,12 @@ components:
 
     ReservationId:
       name: reservation_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/Id" }
+
+    CancellationRequestId:
+      name: cancellation_request_id
       in: path
       required: true
       schema: { $ref: "#/components/schemas/Id" }
@@ -2057,7 +2328,18 @@ components:
       allOf:
         - $ref: "#/components/schemas/ReservationSummary"
         - type: object
-          required: [requested_at, server_time, can_confirm, can_reject]
+          # Every `can_*` field is required. An absent boolean is falsy in
+          # JavaScript, so omitting one would happen to hide the action — but
+          # relying on that is fragile, and a client should never have to guess
+          # whether the server declined to answer.
+          required:
+            [
+              requested_at,
+              server_time,
+              can_confirm,
+              can_reject,
+              can_request_cancellation,
+            ]
           properties:
             customer_id: { $ref: "#/components/schemas/Id" }
             requested_by_user_id:
@@ -2111,21 +2393,130 @@ components:
               type: boolean
             cancellation_request_state:
               description: |
-                Set from S4 when a cancellation request exists. A pending
-                cancellation leaves the reservation `confirmed` and occupying
-                its resources — the two states are shown together, never
-                collapsed into one ambiguous status (UX-04).
+                Set when a cancellation request exists. A pending cancellation
+                leaves the reservation `confirmed` and occupying its resources
+                — the two states are shown together, never collapsed into one
+                ambiguous status (UX-04).
               oneOf:
                 - $ref: "#/components/schemas/CancellationState"
                 - type: "null"
+            cancellation_cutoff_at:
+              description: |
+                `starts_at` minus two hours — the latest instant at which a
+                cancellation request is accepted (BR-07).
+
+                Returned so the UI can state the exact deadline («Отмену можно
+                запросить до 13:00, 25 октября») rather than computing it. A
+                client doing its own arithmetic would show the wrong deadline
+                whenever its clock or timezone is off, and UX-03 requires the
+                customer to identify the cutoff correctly.
+              oneOf:
+                - $ref: "#/components/schemas/Instant"
+                - type: "null"
+            can_request_cancellation:
+              type: boolean
+              description: |
+                The server's judgement, combining state, the cutoff against
+                database time, ownership and whether an active request already
+                exists.
+
+                Like `can_confirm`, this exists so the client never decides.
+                The action must disappear at the server-derived cutoff even if
+                the browser believes there is still time.
 
     CancellationState:
       type: string
       enum: [pending, approved, rejected]
       description: |
-        Separate record from the reservation (S4, BE-08). Declared here so S3
-        clients can render the combined confirmed-plus-pending-cancellation
-        state without a contract change.
+        State of the cancellation *request*, which is a record separate from
+        the reservation (BE-08). While `pending`, the reservation stays
+        `confirmed` and keeps its resources — the two are never merged into a
+        single status.
+
+    CancellationRequest:
+      type: object
+      required:
+        [
+          id,
+          reservation_id,
+          state,
+          requested_at,
+          reservation_starts_at,
+          cancellation_cutoff_at,
+          server_time,
+          can_decide,
+          version,
+        ]
+      properties:
+        id: { $ref: "#/components/schemas/Id" }
+        reservation_id: { $ref: "#/components/schemas/Id" }
+        state: { $ref: "#/components/schemas/CancellationState" }
+        requested_at: { $ref: "#/components/schemas/Instant" }
+        reservation_starts_at:
+          allOf:
+            - $ref: "#/components/schemas/Instant"
+            - description: |
+                Start time as it was when the request was submitted. Stored on
+                the request so a later reschedule cannot silently change what
+                the customer asked to cancel (BE-08).
+        cancellation_cutoff_at:
+          allOf:
+            - $ref: "#/components/schemas/Instant"
+            - description: The two-hour deadline that applied to this request.
+        reason:
+          description: Customer's comment, where supplied and safe to show.
+          oneOf:
+            - type: string
+            - type: "null"
+        decided_at:
+          oneOf:
+            - $ref: "#/components/schemas/Instant"
+            - type: "null"
+        decided_by_user_id:
+          description: Authorized callers only.
+          oneOf:
+            - $ref: "#/components/schemas/Id"
+            - type: "null"
+        decision_reason:
+          oneOf:
+            - type: string
+            - type: "null"
+        customer_display_name:
+          description: Authorized staff only.
+          oneOf:
+            - type: string
+            - type: "null"
+        reservation:
+          description: |
+            Embedded booking context for the P11 queue, so deciding does not
+            require a second request per row. Includes the payment summary only
+            when the actor has finance visibility.
+          oneOf:
+            - $ref: "#/components/schemas/ReservationSummary"
+            - type: "null"
+        server_time: { $ref: "#/components/schemas/Instant" }
+        can_decide:
+          type: boolean
+          description: |
+            Whether this actor may decide this request now. False for a
+            customer, and false once decided. Post-cutoff and post-start
+            decision authority is D-07, so this field must not be read as
+            settling it.
+        version: { $ref: "#/components/schemas/Version" }
+
+    CancellationCutoffError:
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            server_time:
+              allOf:
+                - $ref: "#/components/schemas/Instant"
+                - description: |
+                    The instant the server evaluated. With the cutoff below,
+                    this lets the UI say exactly how late the submission was
+                    instead of rejecting it without explanation.
+            cancellation_cutoff_at: { $ref: "#/components/schemas/Instant" }
 
     ReservationRequestWrite:
       type: object
