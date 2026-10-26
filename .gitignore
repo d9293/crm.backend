@@ -56,3 +56,6 @@ node_modules/
 # openapi-typescript CI scratch output
 api/.generated/
 first.d.ts
+
+# Python virtual environment
+.venv/

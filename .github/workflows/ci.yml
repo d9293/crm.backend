@@ -1,17 +1,10 @@
 # INF-01 — backend verification.
 #
-# The application test and migration jobs do not exist yet: D-01 has not fixed
-# the language, and development/README.md forbids scaffolding a framework
-# before it is resolved. What CAN be verified today is the API contract, so
-# that is what this workflow does.
+# D-01 resolved to Python on 26 October 2026, so this now covers the
+# application as well as the contract.
 #
-# When D-01 lands, BE-00 adds:
-#   - dependency install from a lockfile, lint, typecheck
-#   - migrations applied against an empty PostgreSQL service container
-#   - integration tests against real PostgreSQL, since SQLite and mocks cannot
-#     validate the exclusion constraint, row locking or the AC-01 to AC-03
-#     booking races
-#   - a check that model definitions and migration history have not diverged
+# Still to come with their sprints: the concurrency tests for AC-01 to AC-03,
+# which need the allocation engine from BE-06.
 
 name: CI
 
@@ -83,3 +76,86 @@ jobs:
             exit 1
           fi
           echo "No credential literals found."
+
+  application:
+    name: Lint, typecheck, test, migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Integration tests run against real PostgreSQL. backend.md is explicit
+    # that SQLite and mocks cannot validate the exclusion constraints, row
+    # locking or booking races this system depends on, so there is no
+    # in-memory substitute.
+    services:
+      postgres:
+        image: postgres:18.1-bookworm
+        env:
+          POSTGRES_DB: crm_test
+          POSTGRES_USER: crm_test
+          POSTGRES_PASSWORD: ci_only_not_a_real_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crm_test -d crm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: crm_test
+      POSTGRES_USER: crm_test
+      POSTGRES_PASSWORD: ci_only_not_a_real_secret
+      APP_SECRET_KEY: ci_only_not_a_real_secret
+      TEST_POSTGRES_PASSWORD: ci_only_not_a_real_secret
+      TEST_POSTGRES_PORT: 5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+
+      # btree_gist is created by the migration, so a bare image is enough:
+      # this also proves the migration works on a database that has never seen
+      # crm.infra's db/init scripts — the case a restored dump represents.
+      - name: Apply migrations to an empty database
+        run: alembic upgrade head
+
+      # Models and migration history must not diverge. Without this a model
+      # edit silently stops matching the schema until someone hits a runtime
+      # error in production.
+      - name: Assert no migration drift
+        run: alembic check
+
+      # A migration that cannot be undone is not reversible in an incident.
+      # INF-06 requires a rehearsed rollback, so downgrade is exercised here
+      # rather than discovered to be broken during one.
+      - name: Verify downgrade and re-upgrade
+        run: |
+          set -euo pipefail
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Test
+        run: pytest -q
+
+      - name: Typecheck
+        run: mypy app
+
+      # The image must build, and must not run migrations on start — that is
+      # an explicit operator command (INF-00).
+      - name: Build image
+        run: docker build -t crm-backend:ci .

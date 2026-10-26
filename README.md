@@ -6,9 +6,79 @@ PostgreSQL is the authoritative persistent store. The API contract is versioned 
 
 ## Status
 
-**Not scaffolded.** `development/README.md` §3 states: *"Do not scaffold a framework until D-01 is resolved."* This repository therefore holds documentation, ignore rules and the API contract — no application code.
+**BE-00 complete.** D-01 resolved to **Python** on 26 October 2026: FastAPI, SQLAlchemy 2.x, Alembic, psycopg 3, PostgreSQL 18.
 
-Resolve **D-01** — language, framework, session strategy and supported deployment environment — then BE-00 delivers the modular application layout, migrations and CI.
+The application boots, connects to PostgreSQL, reports health and readiness, and fails in the contract's error shape. No domain endpoints yet — those arrive with their sprints, starting with BE-01 (session and current user) once **D-02** and **D-04** are answered.
+
+## Quick start
+
+Requires Python 3.13 and a running PostgreSQL (`docker compose up -d postgres` in `crm.infra`).
+
+```sh
+py -m venv .venv
+.venv/Scripts/python -m pip install -e ".[dev]"     # Windows
+# source .venv/bin/activate && pip install -e ".[dev]"   # Linux/macOS
+
+# Required — no defaults, by design
+export POSTGRES_DB=crm_dev POSTGRES_USER=crm_dev
+export POSTGRES_PASSWORD=... APP_SECRET_KEY=...
+
+alembic upgrade head
+uvicorn app.main:app --reload
+```
+
+Or through Compose from `crm.infra`:
+
+```sh
+docker compose run --rm migrate      # explicit, never automatic
+docker compose up -d backend
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness. Never touches the database — a database blip must not trigger a container restart. |
+| `GET /ready` | Readiness. Checks PostgreSQL; returns 503 when unreachable. |
+| `GET /docs` | Swagger UI. Disabled when `ENVIRONMENT=production`. |
+
+## Commands
+
+```sh
+ruff check .            # lint
+ruff format .           # format
+mypy app                # typecheck, strict
+pytest -q               # tests
+alembic upgrade head    # apply migrations
+alembic check           # assert models and migrations have not diverged
+alembic downgrade base  # roll back
+```
+
+All of these run in CI and must pass before merge.
+
+## Layout
+
+```
+app/
+  config.py    Settings from the environment. Secrets have no defaults and are
+               redacted from __repr__.
+  errors.py    The single error shape and every handler that produces it.
+  db.py        Engine, session factory, declarative base, naming convention.
+  models.py    Cross-cutting tables: audit_event, idempotency_key.
+  main.py      FastAPI app, CORS, correlation id, health and readiness.
+migrations/    Alembic. The URL comes from settings, never from alembic.ini.
+tests/
+api/           The agreed OpenAPI contract.
+```
+
+## Decisions encoded in the scaffold
+
+Worth knowing before extending it — each exists to prevent a specific failure:
+
+- **`audit_event` is append-only, enforced by a PostgreSQL trigger** that refuses `UPDATE`, `DELETE` *and* `TRUNCATE`. An application-level guard would be bypassed by any direct SQL, and an audit trail that can be quietly rewritten is not evidence of anything.
+- **`idempotency_key` uniqueness is a database constraint** on (key, actor, operation). A concurrent duplicate loses in the database rather than in a check-then-insert race.
+- **Migrations never run on container start.** They are an explicit operator command, so a rolling restart cannot race three migration runs against one database.
+- **`/health` and `/ready` are different questions.** Liveness must not depend on the database.
+- **Secrets have no defaults.** A missing password stops the process at boot rather than falling back to something that happens to work.
+- **Every error carries a correlation id**, including unhandled ones. The detail stays in the log; the client gets a code and an id to quote.
 
 ## API contract
 
