@@ -4,13 +4,17 @@ Versioned OpenAPI contract for the ACE / CSKA CRM. `development/README.md` §3 p
 
 ## Status
 
-`openapi.yaml` — **draft for S0 contract review.** Covers the S1 surface only:
+`openapi.yaml` — **draft for contract review.** Covers S1 and S3:
 
-| Page | Endpoints |
-|---|---|
-| P01 Access | `POST/GET/DELETE /session`, `GET /me` |
-| P02 Employees | `/employees`, `/employees/{id}`, `/archive`, `/sessions`, `/meta/capabilities` |
-| P03 Locations and resources | `/locations`, `/locations/{id}/resources`, `/resources/{id}`, `/resources/{id}/closures` |
+| Sprint | Page | Endpoints |
+|---|---|---|
+| S1 | P01 Access | `POST/GET/DELETE /session`, `GET /me` |
+| S1 | P02 Employees | `/employees`, `/{id}`, `/archive`, `/sessions`, `/meta/capabilities` |
+| S1 | P03 Locations & resources | `/locations`, `/{id}/resources`, `/resources/{id}`, `/closures` |
+| S3 | P07 Availability | `GET /availability` |
+| S3 | P07 Customer request | `POST /reservations/requests` |
+| S3 | P08/P09 Reads | `GET /reservations`, `GET /reservations/{id}` |
+| S3 | P10 Approval queue | `POST /reservations/{id}/confirm`, `/reject` |
 
 Written before the server exists, deliberately: `development/README.md` §3 requires each sprint to begin with contract examples agreed by both teams, and the contract is language-neutral, so it is not blocked by D-01.
 
@@ -64,10 +68,50 @@ Three shapes were chosen where the specification left room. Each is a question f
 
 **3. Sign-in identifier.** `identifier` is deliberately opaque. Whether staff and customers sign in by email, phone or username is part of D-02, and this contract must not fix it by accident.
 
+**4. Rejection reason.** Modelled as optional. `ui-ux.md` §6 forbids requiring a reason because a designer assumed one, so the policy has to be a stated decision — and making it mandatory has not been decided.
+
+**5. Allowed durations.** `GET /availability` returns the permitted durations rather than letting a client offer arbitrary intervals. The demo offered 30 minutes to five hours in half-hour steps; the real list, and any per-customer limit, is D-06.
+
+### Deliberately absent from S3
+
+Not oversights — each needs a decision before it can be specified:
+
+| Missing | Gate |
+|---|---|
+| Staff-created reservations (immediate vs approval) | D-06 |
+| Customer withdrawal of a pending request | D-06 |
+| Active-hold and advance-booking limits | D-06 |
+| Multiple courts as *alternatives* rather than all-together | D-08 |
+| Recurrence and rescheduling | D-08 (S4) |
+| Cancellation request and decision | D-07 (S4) |
+| Structured pricing units and duration-based tariffs | D-10 |
+
+`CancellationState` **is** declared, even though the S4 endpoints are not. A confirmed reservation with a pending cancellation is a state S3 clients must already render correctly (UX-04), and declaring the enum now avoids a contract change to do it.
+
+## The hold mechanism
+
+The S3 endpoints carry the system's hardest correctness requirements. What the contract fixes, and why:
+
+| Rule | Where it is encoded |
+|---|---|
+| Hold is server request-acceptance time + 300s | `POST /reservations/requests`; `hold_expires_at` is absent from the request body, so a caller cannot set or extend it |
+| Confirmation valid only **strictly before** expiry | `confirm` returns 409 `HOLD_EXPIRED`; at exactly the expiry instant the hold is already inactive, even if not yet swept |
+| One outcome under a race | Confirm, reject and expiry serialize; a second decision returns the committed outcome with `current_state` |
+| Expired requests can never be confirmed | `can_confirm` is computed server-side from database time, so a client cannot present an expired request as actionable |
+| Confirmation requires no payment | `financial_summary` is independent and may show an outstanding balance on a confirmed booking (AC-04) |
+| Double-click makes one hold | `Idempotency-Key` is **required**; a replay returns the original with its original expiry — retrying never buys time |
+| No partial allocation | `resource_ids` are all-or-nothing; a 409 means nothing was written |
+| Adjacent intervals don't conflict | `ends_at` documented exclusive throughout — half-open `[start, end)` |
+| Availability can't leak identities | `AvailabilitySlot.unavailable_reason` is coarse (`occupied`/`closed`/`outside_hours`) and does not distinguish a hold from a booking |
+| Client clocks are never trusted | `server_time` on every reservation response and on both conflict shapes |
+
+`can_confirm` deserves a note: it exists so the *server* decides whether a decision is still possible. A client comparing timestamps itself would get it wrong under clock skew, and `ui-ux.md` §6 requires decision buttons to disappear at server expiry.
+
 ## Changelog
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.0 | 26 October 2026 | S3 booking core: availability, customer request with five-minute hold, employee confirm/reject |
 | 0.1.0 | 25 October 2026 | Initial S1 draft for contract review |
 
 Bump the minor version for additive changes within v1. A breaking change requires a new major base path (`/api/v2`), not an edit in place — the frontend's generated types are built from this file.
